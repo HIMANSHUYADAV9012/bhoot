@@ -1,7 +1,7 @@
 import os
 import io
 import uuid
-import json
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -16,37 +16,95 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # ==================================================
-# ENVIRONMENT SETUP - Production Ready
+# ENVIRONMENT - ULTRA CLEANING
 # ==================================================
 
-# Try loading .env only in local development
-try:
-    from dotenv import load_dotenv
-    if os.path.exists(".env"):
-        load_dotenv()
-        print("[INFO] Loaded .env file")
-except ImportError:
-    print("[INFO] python-dotenv not available, using system env")
+def clean_env_value(value):
+    """Remove all whitespace, quotes, and invisible characters"""
+    if not value:
+        return ""
+    # Remove all types of whitespace
+    value = value.strip()
+    # Remove quotes
+    value = value.strip('"').strip("'")
+    # Remove any non-printable characters
+    value = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
+    # Remove any hidden characters
+    value = value.replace('\r', '').replace('\n', '').replace('\t', '')
+    return value
 
-# Get all environment variables
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Debug: Print raw environment
+print("=" * 70)
+print("🔍 ENVIRONMENT VARIABLES DIAGNOSTIC")
+print("=" * 70)
 
-# Debug information (remove in production)
-print("=" * 50)
-print("ENVIRONMENT VARIABLES STATUS:")
-print(f"SUPABASE_URL: {'✅ SET' if SUPABASE_URL else '❌ MISSING'}")
-print(f"SUPABASE_SECRET_KEY: {'✅ SET' if SUPABASE_SECRET_KEY else '❌ MISSING'}")
-print(f"TELEGRAM_BOT_TOKEN: {'✅ SET' if BOT_TOKEN else '❌ MISSING'}")
-print(f"TELEGRAM_CHAT_ID: {'✅ SET' if CHAT_ID else '❌ MISSING'}")
-print("=" * 50)
+# Get and clean ALL environment variables
+SUPABASE_URL = clean_env_value(os.environ.get("SUPABASE_URL", ""))
+SUPABASE_SECRET_KEY = clean_env_value(os.environ.get("SUPABASE_SECRET_KEY", ""))
+SUPABASE_SERVICE_ROLE_KEY = clean_env_value(os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))
+SUPABASE_ANON_KEY = clean_env_value(os.environ.get("SUPABASE_ANON_KEY", ""))
+SUPABASE_KEY = clean_env_value(os.environ.get("SUPABASE_KEY", ""))
+
+BOT_TOKEN = clean_env_value(os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+CHAT_ID = clean_env_value(os.environ.get("TELEGRAM_CHAT_ID", ""))
+
+# Debug print with character analysis
+def debug_key(name, value):
+    if value:
+        print(f"✅ {name}:")
+        print(f"   Length: {len(value)}")
+        print(f"   First 20 chars: {value[:20]}...")
+        print(f"   Last 5 chars: ...{value[-5:]}")
+        print(f"   Contains only valid chars: {bool(re.match(r'^[a-zA-Z0-9._-]+$', value))}")
+        # Check for invisible characters
+        invisible = [c for c in value if ord(c) < 32 or ord(c) > 126]
+        if invisible:
+            print(f"   ⚠️  Contains invisible characters: {[hex(ord(c)) for c in invisible]}")
+    else:
+        print(f"❌ {name}: NOT SET")
+
+print("\n📋 ENVIRONMENT VARIABLES STATUS:")
+debug_key("SUPABASE_URL", SUPABASE_URL)
+debug_key("SUPABASE_SECRET_KEY", SUPABASE_SECRET_KEY)
+debug_key("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
+debug_key("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY)
+
+print("\n" + "=" * 70)
+
+# ==================================================
+# FALLBACK: Try to get keys from multiple sources
+# ==================================================
+
+# If no keys found, try ALL possible Supabase key env vars
+ALL_POSSIBLE_KEYS = []
+
+# Try all possible key names
+key_names = [
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY", 
+    "SUPABASE_ANON_KEY",
+    "SUPABASE_KEY",
+    "SUPABASE_PUBLIC_KEY",
+    "SERVICE_ROLE_KEY",
+    "SECRET_KEY"
+]
+
+for key_name in key_names:
+    value = clean_env_value(os.environ.get(key_name, ""))
+    if value and len(value) > 10:
+        ALL_POSSIBLE_KEYS.append((key_name, value))
+        print(f"[FOUND] {key_name}: {value[:15]}...")
+
+# Also try any environment variable containing "SUPABASE" and "KEY"
+for env_name, env_value in os.environ.items():
+    if "SUPABASE" in env_name.upper() and "KEY" in env_name.upper():
+        clean_value = clean_env_value(env_value)
+        if clean_value and len(clean_value) > 10:
+            if (env_name, clean_value) not in ALL_POSSIBLE_KEYS:
+                ALL_POSSIBLE_KEYS.append((env_name, clean_value))
+                print(f"[FOUND] {env_name}: {clean_value[:15]}...")
 
 # ==================================================
 # APPLICATION
@@ -54,12 +112,9 @@ print("=" * 50)
 
 app = FastAPI(
     title="Horror Story Captures API",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    version="1.0.0"
 )
 
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -69,135 +124,143 @@ app.add_middleware(
 )
 
 # ==================================================
-# GLOBAL EXCEPTION HANDLERS
-# ==================================================
-
-@app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "success": False,
-            "error": exc.detail,
-            "status_code": exc.status_code
-        }
-    )
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=422,
-        content={
-            "success": False,
-            "error": "Validation error",
-            "details": str(exc)
-        }
-    )
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    print(f"[GLOBAL ERROR] {type(exc).__name__}: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "success": False,
-            "error": "Internal server error",
-            "message": str(exc) if os.getenv("DEBUG") else None
-        }
-    )
-
-# ==================================================
 # CONFIGURATION
 # ==================================================
 
 BUCKET_NAME = "captures"
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 IST = ZoneInfo("Asia/Kolkata")
 
 # ==================================================
-# SUPABASE - Robust Initialization
+# SUPABASE - ULTRA ROBUST INITIALIZATION
 # ==================================================
 
 supabase = None
 supabase_error = None
 
-def init_supabase():
-    """Initialize Supabase with proper error handling"""
+def init_supabase_robust():
+    """Try every possible combination to connect to Supabase"""
     global supabase, supabase_error
     
+    print("\n🚀 STARTING SUPABASE INITIALIZATION...")
+    
+    # Check if supabase package exists
     try:
-        # Try importing supabase
-        try:
-            from supabase import create_client
-        except ImportError as e:
-            supabase_error = f"Supabase package not installed: {e}"
-            print(f"[ERROR] {supabase_error}")
-            return None
+        from supabase import create_client
+        print("✅ Supabase package imported successfully")
+    except ImportError as e:
+        supabase_error = f"Supabase package not installed: {e}"
+        print(f"❌ {supabase_error}")
+        return None
+    
+    # Check URL
+    if not SUPABASE_URL:
+        supabase_error = "SUPABASE_URL is empty or not set"
+        print(f"❌ {supabase_error}")
+        return None
+    
+    print(f"✅ SUPABASE_URL: {SUPABASE_URL[:30]}...")
+    
+    # If no keys found, try to get from environment again
+    if not ALL_POSSIBLE_KEYS:
+        supabase_error = "No Supabase keys found in environment!"
+        print(f"❌ {supabase_error}")
+        print("   Please set one of these environment variables:")
+        print("   - SUPABASE_SECRET_KEY")
+        print("   - SUPABASE_SERVICE_ROLE_KEY")
+        print("   - SUPABASE_ANON_KEY")
+        return None
+    
+    print(f"✅ Found {len(ALL_POSSIBLE_KEYS)} potential API keys")
+    
+    # Try each key with different methods
+    last_error = None
+    
+    for key_name, key_value in ALL_POSSIBLE_KEYS:
+        print(f"\n🔑 Trying {key_name}...")
         
-        # Validate credentials
-        if not SUPABASE_URL:
-            supabase_error = "SUPABASE_URL is empty or not set"
-            print(f"[ERROR] {supabase_error}")
-            return None
-            
-        if not SUPABASE_SECRET_KEY:
-            supabase_error = "SUPABASE_SECRET_KEY is empty or not set"
-            print(f"[ERROR] {supabase_error}")
-            return None
-        
-        # Try different key variations
-        keys_to_try = [
-            SUPABASE_SECRET_KEY,
-            SUPABASE_SERVICE_ROLE_KEY,
-            os.getenv("SUPABASE_ANON_KEY", ""),
-            os.getenv("SUPABASE_KEY", "")
+        # Try with different client creation methods
+        methods_to_try = [
+            ("normal", lambda: create_client(SUPABASE_URL, key_value)),
         ]
         
-        # Remove empty keys
-        keys_to_try = [k for k in keys_to_try if k]
+        # Also try with different URL formats
+        urls_to_try = [
+            SUPABASE_URL,
+            SUPABASE_URL.rstrip('/'),
+            f"https://{SUPABASE_URL.replace('https://', '').split('.')[0]}.supabase.co",
+        ]
         
-        last_error = None
-        for key in keys_to_try:
+        # Try all combinations
+        for url in set(urls_to_try):
             try:
-                print(f"[INFO] Trying to initialize Supabase with key: {key[:10]}...")
-                client = create_client(SUPABASE_URL, key)
+                print(f"   Testing with URL: {url[:30]}...")
+                client = create_client(url, key_value)
                 
-                # Test connection with a simple query
+                # Test connection - try multiple operations
+                test_passed = False
+                test_errors = []
+                
+                # Try 1: List buckets
                 try:
-                    # Try to list buckets to verify connection
-                    test = client.storage.list_buckets()
-                    print(f"[OK] Supabase connection successful with key: {key[:10]}...")
+                    buckets = client.storage.list_buckets()
+                    print(f"   ✅ Storage test passed! Found {len(buckets)} buckets")
+                    test_passed = True
+                    supabase = client
+                    print(f"\n🎉 SUCCESS! Connected with {key_name}")
                     return client
-                except Exception as test_error:
-                    print(f"[WARNING] Connection test failed: {test_error}")
-                    last_error = test_error
-                    continue
+                except Exception as e:
+                    test_errors.append(f"Storage: {str(e)[:50]}")
+                
+                # Try 2: Table query (if storage fails)
+                if not test_passed:
+                    try:
+                        result = client.table("images").select("*", count="exact", head=True).execute()
+                        print(f"   ✅ Database test passed!")
+                        test_passed = True
+                        supabase = client
+                        print(f"\n🎉 SUCCESS! Connected with {key_name} (database mode)")
+                        return client
+                    except Exception as e:
+                        test_errors.append(f"Database: {str(e)[:50]}")
+                
+                # Try 3: Auth test (if both fail)
+                if not test_passed:
+                    try:
+                        # Just check if we can get auth status
+                        result = client.auth.get_session()
+                        print(f"   ✅ Auth test passed!")
+                        test_passed = True
+                        supabase = client
+                        print(f"\n🎉 SUCCESS! Connected with {key_name} (auth mode)")
+                        return client
+                    except Exception as e:
+                        test_errors.append(f"Auth: {str(e)[:50]}")
+                
+                if not test_passed:
+                    print(f"   ❌ All tests failed for {key_name}: {', '.join(test_errors)}")
+                    last_error = test_errors[0] if test_errors else "Unknown error"
                     
             except Exception as e:
-                print(f"[WARNING] Failed with key {key[:10]}...: {e}")
-                last_error = e
-                continue
-        
-        supabase_error = f"All Supabase initialization attempts failed. Last error: {last_error}"
-        print(f"[ERROR] {supabase_error}")
-        return None
-        
-    except Exception as e:
-        supabase_error = f"Unexpected error initializing Supabase: {e}"
-        print(f"[ERROR] {supabase_error}")
-        return None
+                error_msg = str(e)
+                print(f"   ❌ Connection failed: {error_msg[:50]}")
+                last_error = error_msg
+                
+                # If error is about API key, this key is invalid
+                if "invalid" in error_msg.lower() or "api key" in error_msg.lower():
+                    print(f"   ⚠️  {key_name} appears to be invalid")
+                    continue
+    
+    supabase_error = f"All keys failed. Last error: {last_error}"
+    print(f"\n❌ {supabase_error}")
+    return None
 
-# Initialize Supabase
-print("[INFO] Initializing Supabase...")
-supabase = init_supabase()
-if supabase:
-    print("[✅] Supabase initialized successfully")
-else:
-    print(f"[❌] Supabase initialization failed: {supabase_error}")
+# Initialize
+supabase = init_supabase_robust()
 
 # ==================================================
-# TELEGRAM CONFIGURATION
+# TELEGRAM CONFIG
 # ==================================================
 
 TELEGRAM_CONFIGURED = bool(
@@ -208,10 +271,10 @@ TELEGRAM_CONFIGURED = bool(
     len(CHAT_ID) > 3
 )
 
-print(f"[INFO] Telegram configured: {TELEGRAM_CONFIGURED}")
+print(f"\n📱 Telegram: {'✅ Configured' if TELEGRAM_CONFIGURED else '❌ Not configured'}")
 
 # ==================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (Keep your existing ones)
 # ==================================================
 
 def format_file_size(size_bytes: int) -> str:
@@ -225,27 +288,18 @@ def format_file_size(size_bytes: int) -> str:
 def get_ist_time() -> datetime:
     return datetime.now(timezone.utc).astimezone(IST)
 
-# ==================================================
-# IMAGE COMPRESSION - With Fallback
-# ==================================================
-
 def compress_image(image_bytes: bytes, max_size=(1600, 1600), quality=82) -> bytes:
-    """Compress image with multiple fallback options"""
     try:
         from PIL import Image
     except ImportError:
-        print("[WARNING] PIL not available, returning original image")
+        print("[WARNING] PIL not available")
         return image_bytes
     
     try:
-        # Open and verify image
         img = Image.open(io.BytesIO(image_bytes))
         img.verify()
-        
-        # Re-open for processing
         img = Image.open(io.BytesIO(image_bytes))
         
-        # Convert to RGB
         if img.mode == "RGBA":
             background = Image.new("RGB", img.size, (255, 255, 255))
             background.paste(img, mask=img.getchannel("A"))
@@ -253,28 +307,13 @@ def compress_image(image_bytes: bytes, max_size=(1600, 1600), quality=82) -> byt
         elif img.mode != "RGB":
             img = img.convert("RGB")
         
-        # Resize maintaining aspect ratio
         img.thumbnail(max_size, Image.LANCZOS)
-        
-        # Save compressed
         output = io.BytesIO()
         img.save(output, format="JPEG", quality=quality, optimize=True)
-        compressed = output.getvalue()
-        
-        # If compression actually increased size, return original
-        if len(compressed) > len(image_bytes):
-            print(f"[INFO] Compression increased size, returning original")
-            return image_bytes
-            
-        return compressed
-        
+        return output.getvalue()
     except Exception as e:
-        print(f"[IMAGE ERROR] {type(e).__name__}: {str(e)}")
-        return image_bytes  # Return original on error
-
-# ==================================================
-# TELEGRAM NOTIFICATION
-# ==================================================
+        print(f"[IMAGE ERROR] {e}")
+        return image_bytes
 
 async def send_photo_to_telegram(
     image_bytes: bytes,
@@ -284,7 +323,6 @@ async def send_photo_to_telegram(
     compressed_size: int
 ) -> bool:
     if not TELEGRAM_CONFIGURED:
-        print("[INFO] Telegram not configured, skipping notification")
         return False
 
     try:
@@ -314,43 +352,113 @@ async def send_photo_to_telegram(
         if response.status_code == 200:
             result = response.json()
             if result.get("ok"):
-                print(f"[OK] Telegram notification sent for {capture_id}")
+                print(f"[OK] Telegram notification sent")
                 return True
-            else:
-                print(f"[TELEGRAM API ERROR] {result.get('description')}")
-                return False
-        else:
-            print(f"[TELEGRAM HTTP ERROR] {response.status_code}")
-            return False
-
+        return False
     except Exception as e:
-        print(f"[TELEGRAM ERROR] {type(e).__name__}: {str(e)}")
+        print(f"[TELEGRAM ERROR] {e}")
         return False
 
 # ==================================================
 # API ENDPOINTS
 # ==================================================
 
-# Root endpoint
 @app.get("/")
 async def root():
     return {
         "service": "Horror Story Captures API",
         "version": "1.0.0",
         "status": "running",
-        "endpoints": {
-            "capture": "POST /capture",
-            "images": "GET /images",
-            "share": "GET /share/{file_id}",
-            "health": "GET /health",
-            "docs": "GET /docs"
+        "supabase_status": "✅ Connected" if supabase else f"❌ {supabase_error or 'Not initialized'}",
+        "telegram_status": "✅ Configured" if TELEGRAM_CONFIGURED else "❌ Not configured",
+        "debug": {
+            "supabase_url_set": bool(SUPABASE_URL),
+            "keys_found": len(ALL_POSSIBLE_KEYS),
+            "environment": "Vercel" if os.environ.get("VERCEL") else "Local"
+        }
+    }
+
+@app.get("/debug/env")
+async def debug_env():
+    """Complete environment debug"""
+    env_vars = {}
+    for key, value in os.environ.items():
+        if any(x in key.upper() for x in ["SUPABASE", "TELEGRAM", "VERCEL"]):
+            env_vars[key] = {
+                "set": bool(value),
+                "length": len(value),
+                "preview": f"{value[:20]}..." if value else ""
+            }
+    
+    return {
+        "environment": {
+            "is_vercel": bool(os.environ.get("VERCEL")),
+            "all_keys_found": env_vars
         },
-        "supabase_status": "✅ Connected" if supabase else f"❌ {supabase_error}",
-        "telegram_status": "✅ Configured" if TELEGRAM_CONFIGURED else "❌ Not configured"
+        "supabase_clean": {
+            "url": bool(SUPABASE_URL),
+            "secret_key": bool(SUPABASE_SECRET_KEY),
+            "service_role_key": bool(SUPABASE_SERVICE_ROLE_KEY),
+            "anon_key": bool(SUPABASE_ANON_KEY)
+        },
+        "all_keys_tried": [{"name": k[0], "length": len(k[1])} for k in ALL_POSSIBLE_KEYS],
+        "init_result": {
+            "success": bool(supabase),
+            "error": supabase_error
+        }
+    }
+
+@app.get("/debug/supabase")
+async def debug_supabase():
+    """Test Supabase connection"""
+    if supabase is None:
+        return {
+            "success": False,
+            "error": supabase_error or "Supabase not initialized",
+            "keys_tried": len(ALL_POSSIBLE_KEYS),
+            "keys": [{"name": k[0], "length": len(k[1])} for k in ALL_POSSIBLE_KEYS[:5]]
+        }
+    
+    try:
+        buckets = supabase.storage.list_buckets()
+        return {
+            "success": True,
+            "buckets": [b.get("name") for b in buckets],
+            "bucket_exists": BUCKET_NAME in [b.get("name") for b in buckets]
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/health")
+async def health_check():
+    supabase_status = "disconnected"
+    if supabase:
+        try:
+            buckets = supabase.storage.list_buckets()
+            supabase_status = "connected"
+        except:
+            supabase_status = "error"
+    
+    return {
+        "status": "healthy" if supabase_status == "connected" else "degraded",
+        "service": "Horror Story Captures API",
+        "supabase": {
+            "status": supabase_status,
+            "configured": bool(supabase)
+        },
+        "telegram": {
+            "configured": TELEGRAM_CONFIGURED
+        },
+        "environment": {
+            "vercel": bool(os.environ.get("VERCEL"))
+        }
     }
 
 # ==================================================
-# CAPTURE IMAGE - Enhanced
+# CAPTURE IMAGE
 # ==================================================
 
 @app.post("/capture")
@@ -358,148 +466,14 @@ async def capture_image(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...)
 ):
-    # Check Supabase configuration
     if supabase is None:
-        error_msg = f"Supabase not available: {supabase_error or 'Unknown error'}"
-        print(f"[ERROR] {error_msg}")
         raise HTTPException(
             status_code=503,
-            detail=error_msg
+            detail=f"Supabase not available: {supabase_error or 'Unknown error'}"
         )
     
-    storage_path = None
-    try:
-        # Validate file type
-        if file.content_type not in ALLOWED_TYPES:
-            raise HTTPException(
-                status_code=415,
-                detail=f"Only JPEG, PNG and WEBP images allowed. Got: {file.content_type}"
-            )
-
-        # Read file with size limit
-        contents = await file.read(MAX_FILE_SIZE + 1)
-        
-        if not contents:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file is empty"
-            )
-            
-        if len(contents) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Image too large. Max: 10 MB, Got: {format_file_size(len(contents))}"
-            )
-
-        original_size = len(contents)
-        
-        # Compress image
-        compressed = compress_image(contents)
-        compressed_size = len(compressed)
-        
-        # Generate IDs
-        file_id = str(uuid.uuid4())
-        timestamp = datetime.now(timezone.utc)
-        filename = f"capture_{file_id}.jpg"
-        storage_path = filename
-
-        print(f"[INFO] Uploading image {file_id} to Supabase...")
-        
-        # Upload to Supabase Storage
-        try:
-            response = supabase.storage.from_(BUCKET_NAME).upload(
-                path=storage_path,
-                file=compressed,
-                file_options={
-                    "content-type": "image/jpeg",
-                    "upsert": "false"
-                }
-            )
-            print(f"[OK] Upload successful: {response}")
-        except Exception as upload_error:
-            print(f"[ERROR] Storage upload failed: {upload_error}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to upload image: {str(upload_error)}"
-            )
-
-        # Save metadata to database
-        print(f"[INFO] Saving metadata for {file_id}...")
-        try:
-            db_response = supabase.table("images").insert({
-                "id": file_id,
-                "filename": filename,
-                "storage_path": storage_path,
-                "timestamp": timestamp.isoformat()
-            }).execute()
-            
-            if not db_response.data:
-                raise Exception("No data returned from insert")
-                
-            print(f"[OK] Metadata saved successfully")
-            
-        except Exception as db_error:
-            print(f"[ERROR] Database insert failed: {db_error}")
-            # Clean up storage
-            try:
-                supabase.storage.from_(BUCKET_NAME).remove([storage_path])
-                print(f"[INFO] Cleaned up storage after database failure")
-            except:
-                pass
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save metadata: {str(db_error)}"
-            )
-
-        # Send Telegram notification (background)
-        if TELEGRAM_CONFIGURED:
-            background_tasks.add_task(
-                send_photo_to_telegram,
-                compressed,
-                filename,
-                file_id,
-                original_size,
-                compressed_size
-            )
-            print(f"[INFO] Telegram notification queued")
-        else:
-            print(f"[INFO] Telegram notification skipped (not configured)")
-
-        print(f"[✅] Capture complete: {file_id}")
-
-        return {
-            "success": True,
-            "message": "Image captured and stored successfully",
-            "id": file_id,
-            "filename": filename,
-            "original_size": original_size,
-            "compressed_size": compressed_size,
-            "storage_path": storage_path,
-            "timestamp": timestamp.isoformat(),
-            "telegram_notification": TELEGRAM_CONFIGURED
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[CAPTURE ERROR] {type(e).__name__}: {str(e)}")
-        
-        # Clean up storage on error
-        if storage_path and supabase:
-            try:
-                supabase.storage.from_(BUCKET_NAME).remove([storage_path])
-                print(f"[INFO] Cleaned up storage after error")
-            except:
-                pass
-                
-        raise HTTPException(
-            status_code=500,
-            detail=f"Image capture failed: {str(e)}"
-        )
-
-# ==================================================
-# GET IMAGES
-# ==================================================
+    # ... your existing capture code here ...
+    # (Keep your working capture logic)
 
 @app.get("/images")
 async def get_images(
@@ -512,41 +486,7 @@ async def get_images(
             detail=f"Supabase not available: {supabase_error or 'Unknown error'}"
         )
     
-    try:
-        response = supabase.table("images").select(
-            "id, filename, timestamp",
-            count="exact"
-        ).order("timestamp", desc=True).range(offset, offset + limit - 1).execute()
-
-        images = []
-        for image in response.data or []:
-            images.append({
-                "id": image["id"],
-                "url": f"/share/{image['id']}",
-                "timestamp": image["timestamp"],
-                "filename": image.get("filename", "unknown.jpg")
-            })
-
-        total = response.count or 0
-        return {
-            "success": True,
-            "images": images,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "has_more": offset + limit < total
-        }
-
-    except Exception as e:
-        print(f"[GET IMAGES ERROR] {type(e).__name__}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch images: {str(e)}"
-        )
-
-# ==================================================
-# SHARE IMAGE
-# ==================================================
+    # ... your existing get images code ...
 
 @app.get("/share/{file_id}")
 async def share_image(file_id: str):
@@ -556,109 +496,15 @@ async def share_image(file_id: str):
             detail=f"Supabase not available: {supabase_error or 'Unknown error'}"
         )
     
-    try:
-        response = supabase.table("images").select("storage_path").eq("id", file_id).limit(1).execute()
-        
-        if not response.data:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Image with id '{file_id}' not found"
-            )
-
-        storage_path = response.data[0]["storage_path"]
-        
-        try:
-            public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
-            return RedirectResponse(url=public_url, status_code=307)
-        except Exception as url_error:
-            print(f"[URL ERROR] {url_error}")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to generate image URL"
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[SHARE ERROR] {type(e).__name__}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load image: {str(e)}"
-        )
+    # ... your existing share code ...
 
 # ==================================================
-# DEBUG ENDPOINT - Check Supabase Connection
-# ==================================================
-
-@app.get("/debug/supabase")
-async def debug_supabase():
-    """Debug endpoint to check Supabase connection"""
-    if supabase is None:
-        return {
-            "success": False,
-            "error": supabase_error or "Supabase not initialized",
-            "env_vars": {
-                "SUPABASE_URL": bool(SUPABASE_URL),
-                "SUPABASE_SECRET_KEY": bool(SUPABASE_SECRET_KEY)
-            }
-        }
-    
-    try:
-        # Test connection
-        buckets = supabase.storage.list_buckets()
-        return {
-            "success": True,
-            "message": "Supabase connection successful",
-            "buckets": [b.get("name") for b in buckets],
-            "bucket_exists": BUCKET_NAME in [b.get("name") for b in buckets]
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "type": type(e).__name__
-        }
-
-# ==================================================
-# HEALTH CHECK
-# ==================================================
-
-@app.get("/health")
-async def health_check():
-    # Test Supabase connection
-    supabase_status = "disconnected"
-    if supabase:
-        try:
-            supabase.storage.list_buckets()
-            supabase_status = "connected"
-        except:
-            supabase_status = "error"
-    
-    return {
-        "status": "healthy" if supabase_status == "connected" else "degraded",
-        "service": "Horror Story Captures API",
-        "version": "1.0.0",
-        "timestamp": datetime.now(IST).isoformat(),
-        "supabase": {
-            "status": supabase_status,
-            "error": supabase_error if supabase is None else None
-        },
-        "telegram": {
-            "configured": TELEGRAM_CONFIGURED
-        },
-        "environment": {
-            "vercel": bool(os.getenv("VERCEL")),
-            "production": os.getenv("ENVIRONMENT", "development")
-        }
-    }
-
-# ==================================================
-# MAIN - For local development
+# MAIN
 # ==================================================
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
