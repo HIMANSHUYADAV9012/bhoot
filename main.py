@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
-from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     File,
@@ -16,27 +15,29 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from PIL import Image
 from supabase import create_client
+import sys
 
 # ==================================================
-
-# ENVIRONMENT
-
+# ENVIRONMENT - Vercel friendly
 # ==================================================
 
-load_dotenv()
+# Try loading .env only in development
+try:
+    from dotenv import load_dotenv
+    # Check if running locally (not on Vercel)
+    if not os.getenv("VERCEL"):
+        load_dotenv()
+except ImportError:
+    pass  # dotenv not installed on Vercel
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
-
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ==================================================
-
 # APPLICATION
-
 # ==================================================
 
 app = FastAPI(
@@ -52,48 +53,36 @@ app.add_middleware(
 )
 
 # ==================================================
-
 # CONFIGURATION
-
 # ==================================================
 
 BUCKET_NAME = "captures"
-
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-
+MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_TYPES = {
     "image/jpeg",
     "image/png",
     "image/webp",
 }
-
 IST = ZoneInfo("Asia/Kolkata")
 
 # ==================================================
-
-# SUPABASE
-
+# SUPA BASE - Lazy initialization
 # ==================================================
 
-if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL environment variable is missing")
-
-if not SUPABASE_SECRET_KEY:
-    raise RuntimeError(
-        "SUPABASE_SECRET_KEY environment variable is missing"
-    )
-
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_SECRET_KEY
-)
-
-print("[OK] Supabase configured successfully")
+# Don't crash on missing env vars - handle gracefully
+if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+    print("[WARNING] Supabase configuration missing")
+    supabase = None
+else:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+        print("[OK] Supabase configured successfully")
+    except Exception as e:
+        print(f"[ERROR] Supabase init failed: {e}")
+        supabase = None
 
 # ==================================================
-
 # TELEGRAM CONFIGURATION
-
 # ==================================================
 
 TELEGRAM_CONFIGURED = bool(
@@ -109,9 +98,44 @@ else:
     print("[WARNING] Telegram configuration missing")
 
 # ==================================================
+# IMAGE PROCESSING - Fallback if PIL not available
+# ==================================================
 
+def compress_image(image_bytes: bytes, max_size=(1600, 1600), quality=82) -> bytes:
+    """Compress image with PIL fallback"""
+    try:
+        # Try importing PIL
+        from PIL import Image
+    except ImportError:
+        # PIL not available - return original image
+        print("[WARNING] PIL not available, returning original image")
+        return image_bytes
+    
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.verify()
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        if img.mode == "RGBA":
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.getchannel("A"))
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        img.thumbnail(max_size, Image.LANCZOS)
+        
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=quality, optimize=True)
+        return output.getvalue()
+    
+    except Exception as e:
+        print(f"[IMAGE ERROR] {type(e).__name__}: {str(e)}")
+        # Return original if compression fails
+        return image_bytes
+
+# ==================================================
 # HELPER FUNCTIONS
-
 # ==================================================
 
 def format_file_size(size_bytes: int) -> str:
@@ -126,75 +150,7 @@ def get_ist_time() -> datetime:
     return datetime.now(timezone.utc).astimezone(IST)
 
 # ==================================================
-
-# IMAGE COMPRESSION
-
-# ==================================================
-
-def compress_image(
-    image_bytes: bytes,
-    max_size=(1600, 1600),
-    quality=82
-) -> bytes:
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-
-        # Verify uploaded file is a valid image
-        img.verify()
-
-        # Re-open image after verify()
-        img = Image.open(io.BytesIO(image_bytes))
-
-        # Convert image to RGB because final output is JPEG
-        if img.mode == "RGBA":
-            background = Image.new(
-                "RGB",
-                img.size,
-                (255, 255, 255)
-            )
-
-            background.paste(
-                img,
-                mask=img.getchannel("A")
-            )
-
-            img = background
-
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-
-        # Resize while keeping original aspect ratio
-        img.thumbnail(
-            max_size,
-            Image.LANCZOS
-        )
-
-        output = io.BytesIO()
-
-        img.save(
-            output,
-            format="JPEG",
-            quality=quality,
-            optimize=True
-        )
-
-        return output.getvalue()
-
-    except Exception as e:
-        print(
-            f"[IMAGE ERROR] "
-            f"{type(e).__name__}: {str(e)}"
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or corrupted image"
-        )
-
-# ==================================================
-
 # TELEGRAM NOTIFICATION
-
 # ==================================================
 
 async def send_photo_to_telegram(
@@ -208,90 +164,46 @@ async def send_photo_to_telegram(
         return False
 
     try:
-        url = (
-            f"https://api.telegram.org/"
-            f"bot{BOT_TOKEN}/sendPhoto"
-        )
-
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         capture_time = get_ist_time()
-
+        
         caption = (
             "📸 <b>NEW IMAGE CAPTURED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🆔 <b>Capture ID:</b> <code>{capture_id}</code>\n"
-            f"🕒 <b>Captured:</b> "
-            f"{capture_time.strftime('%d %b %Y, %I:%M:%S %p')}\n"
+            f"🕒 <b>Captured:</b> {capture_time.strftime('%d %b %Y, %I:%M:%S %p')}\n"
             "🌍 <b>Timezone:</b> IST (India)\n\n"
             f"📁 <b>File:</b> <code>{filename}</code>\n"
-            f"📦 <b>Original Size:</b> "
-            f"{format_file_size(original_size)}\n"
-            f"🗜️ <b>Optimized Size:</b> "
-            f"{format_file_size(compressed_size)}\n\n"
+            f"📦 <b>Original Size:</b> {format_file_size(original_size)}\n"
+            f"🗜️ <b>Optimized Size:</b> {format_file_size(compressed_size)}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "☁️ <b>Status:</b> Stored in Supabase\n"
             "⚡ <b>System:</b> Horror Story Captures"
         )
 
-        data = {
-            "chat_id": CHAT_ID,
-            "caption": caption,
-            "parse_mode": "HTML"
-        }
+        data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+        files = {"photo": (filename, image_bytes, "image/jpeg")}
 
-        files = {
-            "photo": (
-                filename,
-                image_bytes,
-                "image/jpeg"
-            )
-        }
-
-        async with httpx.AsyncClient(
-            timeout=30.0
-        ) as client:
-
-            response = await client.post(
-                url,
-                data=data,
-                files=files
-            )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, data=data, files=files)
 
         if response.status_code == 200:
             result = response.json()
-
             if result.get("ok"):
-                print(
-                    f"[OK] Telegram notification sent "
-                    f"for capture {capture_id}"
-                )
+                print(f"[OK] Telegram notification sent for capture {capture_id}")
                 return True
-
-            print(
-                "[TELEGRAM API ERROR]",
-                result.get("description")
-            )
+            print("[TELEGRAM API ERROR]", result.get("description"))
             return False
 
-        print(
-            "[TELEGRAM HTTP ERROR]",
-            response.status_code,
-            response.text[:300]
-        )
-
+        print("[TELEGRAM HTTP ERROR]", response.status_code)
         return False
 
     except Exception as e:
-        print(
-            f"[TELEGRAM ERROR] "
-            f"{type(e).__name__}: {str(e)}"
-        )
-
+        print(f"[TELEGRAM ERROR] {type(e).__name__}: {str(e)}")
         return False
 
 # ==================================================
-
 # CAPTURE IMAGE
-
 # ==================================================
 
 @app.post("/capture")
@@ -299,91 +211,63 @@ async def capture_image(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...)
 ):
+    if supabase is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase not configured properly"
+        )
+    
     storage_path = None
 
     try:
-        # Validate file content type
         if file.content_type not in ALLOWED_TYPES:
             raise HTTPException(
                 status_code=415,
-                detail=(
-                    "Only JPEG, PNG and WEBP "
-                    "images are allowed"
-                )
+                detail="Only JPEG, PNG and WEBP images are allowed"
             )
 
-        # Read image with size protection
-        contents = await file.read(
-            MAX_FILE_SIZE + 1
-        )
-
+        contents = await file.read(MAX_FILE_SIZE + 1)
         if not contents:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file is empty"
-            )
-
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
         if len(contents) > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail=(
-                    "Image is too large. "
-                    "Maximum allowed size is 10 MB."
-                )
+                detail="Image is too large. Maximum allowed size is 10 MB."
             )
 
         original_size = len(contents)
-
-        # Compress image
         compressed = compress_image(contents)
-
         compressed_size = len(compressed)
-
-        # Generate unique capture ID
         file_id = str(uuid.uuid4())
-
         timestamp = datetime.now(timezone.utc)
-
         filename = f"capture_{file_id}.jpg"
         storage_path = filename
 
-        # Upload image to Supabase Storage
-        supabase.storage.from_(
-            BUCKET_NAME
-        ).upload(
+        # Upload to Supabase Storage
+        supabase.storage.from_(BUCKET_NAME).upload(
             path=storage_path,
             file=compressed,
-            file_options={
-                "content-type": "image/jpeg",
-                "upsert": "false"
-            }
+            file_options={"content-type": "image/jpeg", "upsert": "false"}
         )
 
-        # Save image metadata in Supabase Database
-        db_response = supabase.table(
-            "images"
-        ).insert({
+        # Save metadata
+        db_response = supabase.table("images").insert({
             "id": file_id,
             "filename": filename,
             "storage_path": storage_path,
             "timestamp": timestamp.isoformat()
         }).execute()
 
-        # Verify database insert
         if not db_response.data:
             try:
-                supabase.storage.from_(
-                    BUCKET_NAME
-                ).remove([storage_path])
+                supabase.storage.from_(BUCKET_NAME).remove([storage_path])
             except Exception:
                 pass
-
             raise HTTPException(
                 status_code=500,
                 detail="Failed to save image metadata"
             )
 
-        # Send image to Telegram
         if TELEGRAM_CONFIGURED:
             background_tasks.add_task(
                 send_photo_to_telegram,
@@ -394,9 +278,7 @@ async def capture_image(
                 compressed_size
             )
 
-        print(
-            f"[OK] Capture saved successfully: {file_id}"
-        )
+        print(f"[OK] Capture saved successfully: {file_id}")
 
         return {
             "success": True,
@@ -410,31 +292,17 @@ async def capture_image(
 
     except HTTPException:
         raise
-
     except Exception as e:
-        print(
-            f"[CAPTURE ERROR] "
-            f"{type(e).__name__}: {str(e)}"
-        )
-
-        # Remove uploaded image if database operation fails
-        if storage_path:
+        print(f"[CAPTURE ERROR] {type(e).__name__}: {str(e)}")
+        if storage_path and supabase:
             try:
-                supabase.storage.from_(
-                    BUCKET_NAME
-                ).remove([storage_path])
+                supabase.storage.from_(BUCKET_NAME).remove([storage_path])
             except Exception:
                 pass
-
-        raise HTTPException(
-            status_code=500,
-            detail="Image capture failed"
-        )
+        raise HTTPException(status_code=500, detail="Image capture failed")
 
 # ==================================================
-
 # GET IMAGES
-
 # ==================================================
 
 @app.get("/images")
@@ -442,27 +310,22 @@ async def get_images(
     offset: int = Query(0, ge=0),
     limit: int = Query(6, ge=1, le=20)
 ):
+    if supabase is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase not configured properly"
+        )
+    
     try:
         start = offset
         end = offset + limit - 1
 
-        response = (
-            supabase
-            .table("images")
-            .select(
-                "id, filename, timestamp",
-                count="exact"
-            )
-            .order(
-                "timestamp",
-                desc=True
-            )
-            .range(start, end)
-            .execute()
-        )
+        response = supabase.table("images").select(
+            "id, filename, timestamp",
+            count="exact"
+        ).order("timestamp", desc=True).range(start, end).execute()
 
         images = []
-
         for image in response.data or []:
             images.append({
                 "id": image["id"],
@@ -471,7 +334,6 @@ async def get_images(
             })
 
         total = response.count or 0
-
         return {
             "success": True,
             "images": images,
@@ -482,72 +344,38 @@ async def get_images(
         }
 
     except Exception as e:
-        print(
-            f"[GET IMAGES ERROR] "
-            f"{type(e).__name__}: {str(e)}"
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to fetch images"
-        )
+        print(f"[GET IMAGES ERROR] {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch images")
 
 # ==================================================
-
 # SHARE IMAGE
-
 # ==================================================
 
 @app.get("/share/{file_id}")
 async def share_image(file_id: str):
-    try:
-        response = (
-            supabase
-            .table("images")
-            .select("storage_path")
-            .eq("id", file_id)
-            .limit(1)
-            .execute()
+    if supabase is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase not configured properly"
         )
-
+    
+    try:
+        response = supabase.table("images").select("storage_path").eq("id", file_id).limit(1).execute()
         if not response.data:
-            raise HTTPException(
-                status_code=404,
-                detail="Image not found"
-            )
+            raise HTTPException(status_code=404, detail="Image not found")
 
         storage_path = response.data[0]["storage_path"]
-
-        public_url = (
-            supabase
-            .storage
-            .from_(BUCKET_NAME)
-            .get_public_url(storage_path)
-        )
-
-        return RedirectResponse(
-            url=public_url,
-            status_code=307
-        )
+        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
+        return RedirectResponse(url=public_url, status_code=307)
 
     except HTTPException:
         raise
-
     except Exception as e:
-        print(
-            f"[SHARE ERROR] "
-            f"{type(e).__name__}: {str(e)}"
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to load image"
-        )
+        print(f"[SHARE ERROR] {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load image")
 
 # ==================================================
-
 # HEALTH CHECK
-
 # ==================================================
 
 @app.get("/health")
@@ -557,8 +385,5 @@ async def health_check():
         "service": "Horror Story Captures API",
         "storage": "supabase",
         "telegram_configured": TELEGRAM_CONFIGURED,
-        "supabase_configured": bool(
-            SUPABASE_URL
-            and SUPABASE_SECRET_KEY
-        )
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_SECRET_KEY and supabase is not None)
     }
