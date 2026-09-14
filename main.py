@@ -12,10 +12,13 @@ from fastapi import (
     UploadFile,
     HTTPException,
     Query,
-    BackgroundTasks
+    BackgroundTasks,
+    Request
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
 
 # ==================================================
 # ENVIRONMENT - ULTRA CLEANING
@@ -25,22 +28,17 @@ def clean_env_value(value):
     """Remove all whitespace, quotes, and invisible characters"""
     if not value:
         return ""
-    # Remove all types of whitespace
     value = value.strip()
-    # Remove quotes
     value = value.strip('"').strip("'")
-    # Remove any non-printable characters
     value = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
-    # Remove any hidden characters
     value = value.replace('\r', '').replace('\n', '').replace('\t', '')
     return value
 
-# Debug: Print raw environment
+
 print("=" * 70)
 print("🔍 ENVIRONMENT VARIABLES DIAGNOSTIC")
 print("=" * 70)
 
-# Get and clean ALL environment variables
 SUPABASE_URL = clean_env_value(os.environ.get("SUPABASE_URL", ""))
 SUPABASE_SECRET_KEY = clean_env_value(os.environ.get("SUPABASE_SECRET_KEY", ""))
 SUPABASE_SERVICE_ROLE_KEY = clean_env_value(os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))
@@ -50,7 +48,7 @@ SUPABASE_KEY = clean_env_value(os.environ.get("SUPABASE_KEY", ""))
 BOT_TOKEN = clean_env_value(os.environ.get("TELEGRAM_BOT_TOKEN", ""))
 CHAT_ID = clean_env_value(os.environ.get("TELEGRAM_CHAT_ID", ""))
 
-# Debug print with character analysis
+
 def debug_key(name, value):
     if value:
         print(f"✅ {name}:")
@@ -58,12 +56,12 @@ def debug_key(name, value):
         print(f"   First 20 chars: {value[:20]}...")
         print(f"   Last 5 chars: ...{value[-5:]}")
         print(f"   Contains only valid chars: {bool(re.match(r'^[a-zA-Z0-9._-]+$', value))}")
-        # Check for invisible characters
         invisible = [c for c in value if ord(c) < 32 or ord(c) > 126]
         if invisible:
             print(f"   ⚠️  Contains invisible characters: {[hex(ord(c)) for c in invisible]}")
     else:
         print(f"❌ {name}: NOT SET")
+
 
 print("\n📋 ENVIRONMENT VARIABLES STATUS:")
 debug_key("SUPABASE_URL", SUPABASE_URL)
@@ -73,17 +71,16 @@ debug_key("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY)
 
 print("\n" + "=" * 70)
 
+
 # ==================================================
 # FALLBACK: Try to get keys from multiple sources
 # ==================================================
 
-# If no keys found, try ALL possible Supabase key env vars
 ALL_POSSIBLE_KEYS = []
 
-# Try all possible key names
 key_names = [
     "SUPABASE_SECRET_KEY",
-    "SUPABASE_SERVICE_ROLE_KEY", 
+    "SUPABASE_SERVICE_ROLE_KEY",
     "SUPABASE_ANON_KEY",
     "SUPABASE_KEY",
     "SUPABASE_PUBLIC_KEY",
@@ -97,7 +94,6 @@ for key_name in key_names:
         ALL_POSSIBLE_KEYS.append((key_name, value))
         print(f"[FOUND] {key_name}: {value[:15]}...")
 
-# Also try any environment variable containing "SUPABASE" and "KEY"
 for env_name, env_value in os.environ.items():
     if "SUPABASE" in env_name.upper() and "KEY" in env_name.upper():
         clean_value = clean_env_value(env_value)
@@ -105,6 +101,7 @@ for env_name, env_value in os.environ.items():
             if (env_name, clean_value) not in ALL_POSSIBLE_KEYS:
                 ALL_POSSIBLE_KEYS.append((env_name, clean_value))
                 print(f"[FOUND] {env_name}: {clean_value[:15]}...")
+
 
 # ==================================================
 # APPLICATION
@@ -115,13 +112,98 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+# ==================================================
+# ORIGIN LOCK - SIRF FRONTEND ALLOWED
+# ==================================================
+
+ALLOWED_ORIGINS = [
+    "https://payal-six-sandy.vercel.app",
+]
+
+# Local testing ke liye (Vercel pe automatically skip)
+if not os.environ.get("VERCEL"):
+    ALLOWED_ORIGINS += [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+    ]
+
+# Public endpoints (origin check nahi hoga)
+PUBLIC_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+
+
+class OriginLockMiddleware(BaseHTTPMiddleware):
+    """
+    - Sirf allowed frontend se API calls accept karta hai.
+    - /share/* ko <img> tag se load hone deta hai (Sec-Fetch-Dest: image).
+    - Direct browser/curl/Postman sab block.
+    """
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # Preflight hamesha allow
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Public paths allow
+        if path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        sec_fetch_site = request.headers.get("sec-fetch-site", "")
+        sec_fetch_mode = request.headers.get("sec-fetch-mode", "")
+        sec_fetch_dest = request.headers.get("sec-fetch-dest", "")
+
+        origin_ok = any(origin == o for o in ALLOWED_ORIGINS)
+        referer_ok = any(referer.startswith(o + "/") or referer == o for o in ALLOWED_ORIGINS)
+
+        # Browser requests me Sec-Fetch-* hote hain, curl/Postman me nahi
+        is_browser_request = bool(sec_fetch_site or sec_fetch_mode)
+
+        # ---- SPECIAL CASE: /share/* images ----
+        # <img src="..."> se aane wali request me:
+        #   Sec-Fetch-Dest: image
+        # Direct browser open me: Sec-Fetch-Dest: document  -> BLOCK
+        # Curl/Postman me: Sec-Fetch-Dest missing -> BLOCK
+        if path.startswith("/share/"):
+            if sec_fetch_dest == "image" and (
+                referer_ok or sec_fetch_site in ("cross-site", "same-origin", "same-site")
+            ):
+                return await call_next(request)
+            # warna neeche wale normal checks pe chala jayega -> block
+
+        if not (origin_ok or referer_ok):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "Forbidden: ye API sirf authorized frontend ke liye hai."
+                }
+            )
+
+        if not is_browser_request:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "Forbidden: direct access not allowed."
+                }
+            )
+
+        return await call_next(request)
+
+
+app.add_middleware(OriginLockMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
 
 # ==================================================
 # CONFIGURATION
@@ -132,6 +214,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 IST = ZoneInfo("Asia/Kolkata")
 
+
 # ==================================================
 # SUPABASE - ULTRA ROBUST INITIALIZATION
 # ==================================================
@@ -139,13 +222,12 @@ IST = ZoneInfo("Asia/Kolkata")
 supabase = None
 supabase_error = None
 
+
 def init_supabase_robust():
-    """Try every possible combination to connect to Supabase"""
     global supabase, supabase_error
-    
+
     print("\n🚀 STARTING SUPABASE INITIALIZATION...")
-    
-    # Check if supabase package exists
+
     try:
         from supabase import create_client
         print("✅ Supabase package imported successfully")
@@ -153,56 +235,40 @@ def init_supabase_robust():
         supabase_error = f"Supabase package not installed: {e}"
         print(f"❌ {supabase_error}")
         return None
-    
-    # Check URL
+
     if not SUPABASE_URL:
         supabase_error = "SUPABASE_URL is empty or not set"
         print(f"❌ {supabase_error}")
         return None
-    
+
     print(f"✅ SUPABASE_URL: {SUPABASE_URL[:30]}...")
-    
-    # If no keys found, try to get from environment again
+
     if not ALL_POSSIBLE_KEYS:
         supabase_error = "No Supabase keys found in environment!"
         print(f"❌ {supabase_error}")
-        print("   Please set one of these environment variables:")
-        print("   - SUPABASE_SECRET_KEY")
-        print("   - SUPABASE_SERVICE_ROLE_KEY")
-        print("   - SUPABASE_ANON_KEY")
         return None
-    
+
     print(f"✅ Found {len(ALL_POSSIBLE_KEYS)} potential API keys")
-    
-    # Try each key with different methods
+
     last_error = None
-    
+
     for key_name, key_value in ALL_POSSIBLE_KEYS:
         print(f"\n🔑 Trying {key_name}...")
-        
-        # Try with different client creation methods
-        methods_to_try = [
-            ("normal", lambda: create_client(SUPABASE_URL, key_value)),
-        ]
-        
-        # Also try with different URL formats
+
         urls_to_try = [
             SUPABASE_URL,
             SUPABASE_URL.rstrip('/'),
             f"https://{SUPABASE_URL.replace('https://', '').split('.')[0]}.supabase.co",
         ]
-        
-        # Try all combinations
+
         for url in set(urls_to_try):
             try:
                 print(f"   Testing with URL: {url[:30]}...")
                 client = create_client(url, key_value)
-                
-                # Test connection - try multiple operations
+
                 test_passed = False
                 test_errors = []
-                
-                # Try 1: List buckets
+
                 try:
                     buckets = client.storage.list_buckets()
                     print(f"   ✅ Storage test passed! Found {len(buckets)} buckets")
@@ -212,8 +278,7 @@ def init_supabase_robust():
                     return client
                 except Exception as e:
                     test_errors.append(f"Storage: {str(e)[:50]}")
-                
-                # Try 2: Table query (if storage fails)
+
                 if not test_passed:
                     try:
                         result = client.table("images").select("*", count="exact", head=True).execute()
@@ -224,11 +289,9 @@ def init_supabase_robust():
                         return client
                     except Exception as e:
                         test_errors.append(f"Database: {str(e)[:50]}")
-                
-                # Try 3: Auth test (if both fail)
+
                 if not test_passed:
                     try:
-                        # Just check if we can get auth status
                         result = client.auth.get_session()
                         print(f"   ✅ Auth test passed!")
                         test_passed = True
@@ -237,27 +300,27 @@ def init_supabase_robust():
                         return client
                     except Exception as e:
                         test_errors.append(f"Auth: {str(e)[:50]}")
-                
+
                 if not test_passed:
                     print(f"   ❌ All tests failed for {key_name}: {', '.join(test_errors)}")
                     last_error = test_errors[0] if test_errors else "Unknown error"
-                    
+
             except Exception as e:
                 error_msg = str(e)
                 print(f"   ❌ Connection failed: {error_msg[:50]}")
                 last_error = error_msg
-                
-                # If error is about API key, this key is invalid
+
                 if "invalid" in error_msg.lower() or "api key" in error_msg.lower():
                     print(f"   ⚠️  {key_name} appears to be invalid")
                     continue
-    
+
     supabase_error = f"All keys failed. Last error: {last_error}"
     print(f"\n❌ {supabase_error}")
     return None
 
-# Initialize
+
 supabase = init_supabase_robust()
+
 
 # ==================================================
 # TELEGRAM CONFIG
@@ -273,8 +336,9 @@ TELEGRAM_CONFIGURED = bool(
 
 print(f"\n📱 Telegram: {'✅ Configured' if TELEGRAM_CONFIGURED else '❌ Not configured'}")
 
+
 # ==================================================
-# HELPER FUNCTIONS (Keep your existing ones)
+# HELPER FUNCTIONS
 # ==================================================
 
 def format_file_size(size_bytes: int) -> str:
@@ -285,8 +349,10 @@ def format_file_size(size_bytes: int) -> str:
     else:
         return f"{size_bytes / (1024 * 1024):.2f} MB"
 
+
 def get_ist_time() -> datetime:
     return datetime.now(timezone.utc).astimezone(IST)
+
 
 def compress_image(image_bytes: bytes, max_size=(1600, 1600), quality=82) -> bytes:
     try:
@@ -294,19 +360,19 @@ def compress_image(image_bytes: bytes, max_size=(1600, 1600), quality=82) -> byt
     except ImportError:
         print("[WARNING] PIL not available")
         return image_bytes
-    
+
     try:
         img = Image.open(io.BytesIO(image_bytes))
         img.verify()
         img = Image.open(io.BytesIO(image_bytes))
-        
+
         if img.mode == "RGBA":
             background = Image.new("RGB", img.size, (255, 255, 255))
             background.paste(img, mask=img.getchannel("A"))
             img = background
         elif img.mode != "RGB":
             img = img.convert("RGB")
-        
+
         img.thumbnail(max_size, Image.LANCZOS)
         output = io.BytesIO()
         img.save(output, format="JPEG", quality=quality, optimize=True)
@@ -314,6 +380,7 @@ def compress_image(image_bytes: bytes, max_size=(1600, 1600), quality=82) -> byt
     except Exception as e:
         print(f"[IMAGE ERROR] {e}")
         return image_bytes
+
 
 async def send_photo_to_telegram(
     image_bytes: bytes,
@@ -328,7 +395,7 @@ async def send_photo_to_telegram(
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         capture_time = get_ist_time()
-        
+
         caption = (
             "📸 <b>NEW IMAGE CAPTURED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -359,6 +426,7 @@ async def send_photo_to_telegram(
         print(f"[TELEGRAM ERROR] {e}")
         return False
 
+
 # ==================================================
 # API ENDPOINTS
 # ==================================================
@@ -369,79 +437,21 @@ async def root():
         "service": "Horror Story Captures API",
         "version": "1.0.0",
         "status": "running",
-        "supabase_status": "✅ Connected" if supabase else f"❌ {supabase_error or 'Not initialized'}",
+        "supabase_status": "✅ Connected" if supabase else "❌ Not initialized",
         "telegram_status": "✅ Configured" if TELEGRAM_CONFIGURED else "❌ Not configured",
-        "debug": {
-            "supabase_url_set": bool(SUPABASE_URL),
-            "keys_found": len(ALL_POSSIBLE_KEYS),
-            "environment": "Vercel" if os.environ.get("VERCEL") else "Local"
-        }
     }
 
-@app.get("/debug/env")
-async def debug_env():
-    """Complete environment debug"""
-    env_vars = {}
-    for key, value in os.environ.items():
-        if any(x in key.upper() for x in ["SUPABASE", "TELEGRAM", "VERCEL"]):
-            env_vars[key] = {
-                "set": bool(value),
-                "length": len(value),
-                "preview": f"{value[:20]}..." if value else ""
-            }
-    
-    return {
-        "environment": {
-            "is_vercel": bool(os.environ.get("VERCEL")),
-            "all_keys_found": env_vars
-        },
-        "supabase_clean": {
-            "url": bool(SUPABASE_URL),
-            "secret_key": bool(SUPABASE_SECRET_KEY),
-            "service_role_key": bool(SUPABASE_SERVICE_ROLE_KEY),
-            "anon_key": bool(SUPABASE_ANON_KEY)
-        },
-        "all_keys_tried": [{"name": k[0], "length": len(k[1])} for k in ALL_POSSIBLE_KEYS],
-        "init_result": {
-            "success": bool(supabase),
-            "error": supabase_error
-        }
-    }
-
-@app.get("/debug/supabase")
-async def debug_supabase():
-    """Test Supabase connection"""
-    if supabase is None:
-        return {
-            "success": False,
-            "error": supabase_error or "Supabase not initialized",
-            "keys_tried": len(ALL_POSSIBLE_KEYS),
-            "keys": [{"name": k[0], "length": len(k[1])} for k in ALL_POSSIBLE_KEYS[:5]]
-        }
-    
-    try:
-        buckets = supabase.storage.list_buckets()
-        return {
-            "success": True,
-            "buckets": [b.get("name") for b in buckets],
-            "bucket_exists": BUCKET_NAME in [b.get("name") for b in buckets]
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
 
 @app.get("/health")
 async def health_check():
     supabase_status = "disconnected"
     if supabase:
         try:
-            buckets = supabase.storage.list_buckets()
+            supabase.storage.list_buckets()
             supabase_status = "connected"
-        except:
+        except Exception:
             supabase_status = "error"
-    
+
     return {
         "status": "healthy" if supabase_status == "connected" else "degraded",
         "service": "Horror Story Captures API",
@@ -451,11 +461,9 @@ async def health_check():
         },
         "telegram": {
             "configured": TELEGRAM_CONFIGURED
-        },
-        "environment": {
-            "vercel": bool(os.environ.get("VERCEL"))
         }
     }
+
 
 # ==================================================
 # CAPTURE IMAGE
@@ -471,9 +479,14 @@ async def capture_image(
             status_code=503,
             detail=f"Supabase not available: {supabase_error or 'Unknown error'}"
         )
-    
+
     # ... your existing capture code here ...
     # (Keep your working capture logic)
+
+
+# ==================================================
+# GET IMAGES
+# ==================================================
 
 @app.get("/images")
 async def get_images(
@@ -485,8 +498,13 @@ async def get_images(
             status_code=503,
             detail=f"Supabase not available: {supabase_error or 'Unknown error'}"
         )
-    
+
     # ... your existing get images code ...
+
+
+# ==================================================
+# SHARE IMAGE
+# ==================================================
 
 @app.get("/share/{file_id}")
 async def share_image(file_id: str):
@@ -495,8 +513,9 @@ async def share_image(file_id: str):
             status_code=503,
             detail=f"Supabase not available: {supabase_error or 'Unknown error'}"
         )
-    
+
     # ... your existing share code ...
+
 
 # ==================================================
 # MAIN
